@@ -2,6 +2,14 @@ from fastapi import APIRouter
 from app.services.qdrant_service import client
 from app.services.embedding_service import get_embedding
 from groq import Groq
+from app.services.redis_service import (
+    save_chat,
+    get_chat_history,
+    save_booking
+)
+import re
+import json
+import uuid
 import os
 
 router = APIRouter()
@@ -9,10 +17,53 @@ router = APIRouter()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
+# SAFE JSON EXTRACTION
+def clean_json(text: str):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return None
+
+
+# BOOKING EXTRACTION
+def extract_booking(text: str):
+    prompt = f"""
+Extract booking details from the message.
+
+Return ONLY valid JSON:
+{{
+  "name": "",
+  "email": "",
+  "date": "",
+  "time": ""
+}}
+
+If missing, use null.
+
+Message:
+{text}
+"""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.choices[0].message.content
+
+
+# CHAT ENDPOINT
 @router.post("/chat")
-async def chat(query: str):
+async def chat(query: str, session_id: str = None):
 
     try:
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        save_chat(session_id, "user", query)
+
+        history = get_chat_history(session_id)
+
         query_vector = get_embedding(query)
 
         results = client.query_points(
@@ -22,31 +73,51 @@ async def chat(query: str):
             with_payload=True
         )
 
-        context_chunks = []
+        context = "\n\n".join(
+            hit.payload.get("text", "")
+            for hit in results.points
+            if hit.payload
+        )
 
-        for hit in results.points:
-            payload = getattr(hit, "payload", None)
+        chat_history_text = "\n".join(
+            f"{h['role']}: {h['message']}"
+            for h in history
+        )
 
-            if payload and "text" in payload:
-                context_chunks.append(payload["text"])
+        # BOOKING EXTRACTION (FIXED)
+        booking_raw = extract_booking(query)
 
-        context = "\n\n".join(context_chunks)
+        cleaned = clean_json(booking_raw)
 
+        booking = None
+
+        if cleaned:
+            try:
+                booking = json.loads(cleaned)
+
+                if booking.get("name") or booking.get("email"):
+                    save_booking(session_id, booking)
+
+            except:
+                booking = None
+
+        # LLM PROMPT
         prompt = f"""
 You are a helpful AI assistant.
 
-Use ONLY the context below to answer the question.
-If the answer is not in the context, say "I don't know based on the document."
+Chat History:
+{chat_history_text}
 
 Context:
 {context}
 
-Question:
+User Question:
 {query}
 
-Answer clearly and concisely.
+Answer clearly and use context if needed.
 """
 
+        # LLM RESPONSE
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -55,12 +126,15 @@ Answer clearly and concisely.
         )
 
         answer = response.choices[0].message.content
-        
+
+        save_chat(session_id, "assistant", answer)
+
         return {
+            "session_id": session_id,
             "query": query,
             "answer": answer,
             "sources_found": len(results.points),
-            "context_used": context[:300]
+            "booking_extracted": booking
         }
 
     except Exception as e:

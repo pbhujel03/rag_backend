@@ -1,4 +1,14 @@
-.venv/
 __pycache__/
+*.py[cod]
+*$py.class
 .env
-*.pyc
+.venv
+venv/
+ENV/
+
+# Local data
+uploaded_files/
+
+# Distribution / packaging
+dist/
+build/
